@@ -27,11 +27,6 @@
 
 #include "macros.h"
 
-#include <stdlib.h>
-#include <stdint.h>  
-#include <stdbool.h> 
-#include <string.h>  
-
 
 #define COPY_A 0
 #define COPY_B 1
