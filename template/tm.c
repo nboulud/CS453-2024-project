@@ -33,6 +33,7 @@
 #include <string.h>  
 
 
+
 #define COPY_A 0
 #define COPY_B 1
 
@@ -49,18 +50,27 @@ struct transaction {
     uint64_t epoch;
     bool is_ro;
     bool aborted;
+    // Write set for the transaction
+    struct write_entry* write_set_head;
+    struct write_entry* write_set_tail;
+    // Allocation and deallocation lists
+    struct segment_node* alloc_segments;
+    struct segment_node* free_segments;
+    // Other fields as needed
 };
 
 struct batcher_str {
     uint64_t epoch;
     uint64_t transaction_count;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
     
 };
 
 struct write_entry {
-    void* address;               // Address in shared memory to write to
-    uintptr_t value;             // Value to write
-    struct write_entry* next;    // Pointer to the next write entry
+    size_t word_index;          // Index of the word in the versions array
+    uintptr_t value;            // Value to write
+    struct write_entry* next;   // Next write entry
 };
 
 struct commit_list_t {
@@ -76,7 +86,13 @@ struct region {
     uint64_t epoch;
     struct batcher_str batcher;
     struct commit_list_t commit_list;
+    struct segment_node* allocated_segments;
+};
 
+struct segment_node {
+    void* segment;
+    size_t size;
+    struct segment_node* next;
 };
 
 
@@ -185,7 +201,8 @@ tx_t tm_begin(shared_t unused(shared), bool unused(is_ro)) {
         init_rw_sets(tx);
     }
 
-    return tx;
+    return (tx_t)(uintptr_t)tx;
+    //return tx;
     
 }
 
@@ -364,3 +381,156 @@ bool tm_free(shared_t unused(shared), tx_t unused(tx), void* unused(target)) {
     add_deallocation(tx, target);
     return true;
 }
+
+
+
+
+
+
+
+void init_batcher(struct batcher_str* batcher) {
+    batcher->epoch = 0;
+    atomic_init(&batcher->transaction_count, 0);
+    pthread_mutex_init(&batcher->mutex, NULL);
+    pthread_cond_init(&batcher->cond, NULL);
+}
+
+void wait_for_no_transactions(struct batcher_str* batcher) {
+    pthread_mutex_lock(&batcher->mutex);
+    while (atomic_load(&batcher->transaction_count) > 0) {
+        pthread_cond_wait(&batcher->cond, &batcher->mutex);
+    }
+    pthread_mutex_unlock(&batcher->mutex);
+}
+
+void cleanup_batcher(struct batcher_str* batcher) {
+    pthread_mutex_destroy(&batcher->mutex);
+    pthread_cond_destroy(&batcher->cond);
+}
+
+void enter_batcher(struct batcher_str* batcher) {
+    atomic_fetch_add(&batcher->transaction_count, 1);
+}
+
+uint64_t get_current_epoch(struct batcher_str* batcher) {
+    return batcher->epoch;
+}
+
+bool leave_batcher(struct batcher_str* batcher) {
+    if (atomic_fetch_sub(&batcher->transaction_count, 1) == 1) {
+        // This was the last transaction
+        pthread_mutex_lock(&batcher->mutex);
+        pthread_cond_broadcast(&batcher->cond);
+        pthread_mutex_unlock(&batcher->mutex);
+        return true;
+    }
+    return false;
+}
+
+void init_rw_sets(struct transaction* tx) {
+    tx->write_set_head = NULL;
+    tx->write_set_tail = NULL;
+    tx->alloc_segments = NULL;
+    tx->free_segments = NULL;
+}
+
+void cleanup_transaction(struct transaction* tx) {
+    // Free write set
+    struct write_entry* entry = tx->write_set_head;
+    while (entry) {
+        struct write_entry* next = entry->next;
+        free(entry);
+        entry = next;
+    }
+    // Free allocated segments (if any)
+    // Handle allocation and deallocation lists
+    free(tx);
+}
+
+void add_to_commit_list(struct commit_list_t* clist, struct transaction* tx) {
+    if (tx->write_set_head == NULL) {
+        // No writes to commit
+        return;
+    }
+    if (clist->tail == NULL) {
+        // Commit list is empty
+        clist->head = tx->write_set_head;
+        clist->tail = tx->write_set_tail;
+    } else {
+        // Append transaction's write set to the commit list
+        clist->tail->next = tx->write_set_head;
+        clist->tail = tx->write_set_tail;
+    }
+}
+
+
+void perform_epoch_commit(struct region* reg) {
+    struct write_entry* entry = reg->commit_list.head;
+
+    while (entry) {
+        Word* word = &reg->word[entry->word_index];
+        // Apply the write by updating the appropriate copy
+        // Swap the readable copy if necessary
+        word->copyA = entry->value; // Example for swapping to copyA
+        word->readable_copy = COPY_A;
+
+        struct write_entry* next = entry->next;
+        free(entry);
+        entry = next;
+    }
+
+    // Reset the commit list
+    reg->commit_list.head = NULL;
+    reg->commit_list.tail = NULL;
+
+    // Update the epoch
+    reg->epoch++;
+
+    // Reset write flags and access sets
+    for (size_t i = 0; i < reg->word_count; i++) {
+        reg->word[i].already_written = false;
+        reg->word[i].access_set = 0;
+    }
+}
+
+bool transaction_in_access_set(Word* word, struct transaction* tx) {
+    // Let's assume each transaction has a unique ID (e.g., pointer value)
+    uint64_t tx_id = (uint64_t)(uintptr_t) tx;
+    return (word->access_set & tx_id) != 0;
+}
+
+uintptr_t get_writable_copy(Word* word, struct transaction* tx) {
+    // Assuming transactions write to copyB when readable_copy is COPY_A
+    if (word->readable_copy == COPY_A) {
+        return word->copyB;
+    } else {
+        return word->copyA;
+    }
+}
+
+void add_transaction_to_access_set(Word* word, struct transaction* tx) {
+    uint64_t tx_id = (uint64_t)(uintptr_t) tx;
+    word->access_set |= tx_id;
+}
+
+void set_writable_copy(Word* word, struct transaction* tx, uintptr_t value) {
+    // Assuming transactions write to copyB when readable_copy is COPY_A
+    if (word->readable_copy == COPY_A) {
+        word->copyB = value;
+    } else {
+        word->copyA = value;
+    }
+}
+
+bool access_set_not_empty(Word* word) {
+    return word->access_set != 0;
+}
+
+void add_allocated_segment(struct transaction* tx, Word* segment, size_t word_count) {
+    struct segment_node* node = malloc(sizeof(struct segment_node));
+    node->segment = segment;
+    node->size = word_count * sizeof(Word);
+    node->next = tx->alloc_segments;
+    tx->alloc_segments = node;
+}
+
