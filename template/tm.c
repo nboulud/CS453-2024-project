@@ -538,3 +538,11 @@ void add_allocated_segment(struct transaction* tx, Word* segment, size_t word_co
     tx->alloc_segments = node;
 }
 
+void add_deallocation(struct transaction* tx, void* target) {
+    struct segment_node* node = malloc(sizeof(struct segment_node));
+    node->segment = target;
+    node->size = 0; // Size may not be necessary here
+    node->next = tx->free_segments;
+    tx->free_segments = node;
+}
+
