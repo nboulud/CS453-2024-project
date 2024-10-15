@@ -31,6 +31,8 @@
 #include <stdint.h>  
 #include <stdbool.h> 
 #include <string.h>  
+#include <sys/_pthread/_pthread_mutex_t.h>
+#include <sys/_pthread/_pthread_cond_t.h>
 
 
 
@@ -43,7 +45,7 @@ typedef struct{
     uintptr_t copyB;
     int readable_copy; //Indique quelle copie est lisible (AouB)
     bool already_written; 
-    uint64_t access_set;
+    _Atomic uint64_t access_set;
 }Word;
 
 struct transaction {
@@ -61,7 +63,7 @@ struct transaction {
 
 struct batcher_str {
     uint64_t epoch;
-    uint64_t transaction_count;
+    _Atomic uint64_t transaction_count;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     
@@ -258,9 +260,14 @@ bool tm_read(shared_t unused(shared), tx_t unused(tx), void const* unused(source
     uintptr_t addr = (uintptr_t) source;
     size_t word_index = (addr - (uintptr_t) reg->word) / reg->align;
     struct transaction* txt = (struct transaction*) tx;
+
     
     for (size_t i = 0; i < size / reg->align; i++) {
         Word* word_t = &reg->word[word_index + i];
+        if (atomic_load(&word_t->access_set) != 0 && !txt->is_ro) {
+            txt->aborted = true;
+            return false;
+        }
         if (txt->is_ro) {
             
             if (word_t->readable_copy == COPY_A) {
@@ -312,6 +319,10 @@ bool tm_write(shared_t unused(shared), tx_t unused(tx), void const* unused(sourc
     for (size_t i = 0; i < size / reg->align; i++) {
         Word* word_t = &reg->word[word_index + i];
         
+        if (atomic_load(&word_t->access_set) != 0) {
+            txt->aborted = true;
+            return false;
+        }
         if (word_t->already_written) {
             if (transaction_in_access_set(word_t, tx)) {
                 
@@ -381,9 +392,6 @@ bool tm_free(shared_t unused(shared), tx_t unused(tx), void* unused(target)) {
     add_deallocation(tx, target);
     return true;
 }
-
-
-
 
 
 
@@ -469,14 +477,10 @@ void perform_epoch_commit(struct region* reg) {
 
     while (entry) {
         Word* word = &reg->word[entry->word_index];
-        // Apply the write by updating the appropriate copy
-        // Swap the readable copy if necessary
-        word->copyA = entry->value; // Example for swapping to copyA
-        word->readable_copy = COPY_A;
+        atomic_store(&word->copyA, entry->value);  
+        atomic_store(&word->readable_copy, COPY_A); 
 
-        struct write_entry* next = entry->next;
-        free(entry);
-        entry = next;
+        entry = entry->next;
     }
 
     // Reset the commit list
