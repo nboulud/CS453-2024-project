@@ -28,6 +28,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
 
 // -------------------------------------------------------------------------- //
 
@@ -59,3 +60,84 @@ bool     tm_read(shared_t, tx_t, void const*, size_t, void*);
 bool     tm_write(shared_t, tx_t, void const*, size_t, void*);
 alloc_t  tm_alloc(shared_t, tx_t, size_t, void**);
 bool     tm_free(shared_t, tx_t, void*);
+
+
+
+#define COPY_A 0
+#define COPY_B 1
+
+typedef struct Word{
+    uintptr_t copyA;
+    uintptr_t copyB;
+    int readable_copy; //Indique quelle copie est lisible (AouB)
+    bool already_written; 
+    _Atomic uint64_t access_set;
+}Word;
+
+typedef struct transaction {
+    uint64_t epoch;
+    bool is_ro;
+    bool aborted;
+    // Write set for the transaction
+    struct write_entry* write_set_head;
+    struct write_entry* write_set_tail;
+    // Allocation and deallocation lists
+    struct segment_node* alloc_segments;
+    struct segment_node* free_segments;
+    // Other fields as needed
+} transaction;
+
+typedef struct batcher_str {
+    uint64_t epoch;
+    _Atomic uint64_t transaction_count;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+} batcher_str;
+
+typedef struct write_entry {
+    size_t word_index;          // Index of the word in the versions array
+    uintptr_t value;            // Value to write
+    struct write_entry* next;   // Next write entry
+} write_entry;
+
+typedef struct commit_list_t {
+    struct write_entry* head;    // Head of the combined write sets
+    struct write_entry* tail;    // Tail of the combined write sets
+} commit_list_t;
+
+typedef struct region {
+    Word* word;
+    size_t word_count; //Nombre de mot dans la sharded memory region
+    size_t size;        
+    size_t align;  
+    uint64_t epoch;
+    struct batcher_str batcher;
+    struct commit_list_t commit_list;
+    struct segment_node* allocated_segments;
+}region;
+
+typedef struct segment_node {
+    void* segment;
+    size_t size;
+    struct segment_node* next;
+}segment_node;
+
+
+
+void init_batcher(struct batcher_str* batcher);
+void wait_for_no_transactions(struct batcher_str* batcher);
+void cleanup_batcher(struct batcher_str* batcher);
+void enter_batcher(struct batcher_str* batcher);
+uint64_t get_current_epoch(struct batcher_str* batcher);
+bool leave_batcher(struct batcher_str* batcher);
+void init_rw_sets(struct transaction* tx);
+void cleanup_transaction(struct transaction* tx);
+void add_to_commit_list(struct commit_list_t* clist, struct transaction* tx);
+void perform_epoch_commit(struct region* reg);
+bool transaction_in_access_set(Word* word, struct transaction* tx);
+uintptr_t get_writable_copy(Word* word, struct transaction* tx);
+void add_transaction_to_access_set(Word* word, struct transaction* tx);
+void set_writable_copy(Word* word, struct transaction* tx, uintptr_t value);
+bool access_set_not_empty(Word* word);
+void add_allocated_segment(struct transaction* tx, Word* segment, size_t word_count);
+void add_deallocation(struct transaction* tx, void* target);

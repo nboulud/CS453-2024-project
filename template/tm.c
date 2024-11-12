@@ -30,72 +30,7 @@
 #include <stdlib.h>
 #include <stdint.h>  
 #include <stdbool.h> 
-#include <string.h>  
-#include <sys/_pthread/_pthread_mutex_t.h>
-#include <sys/_pthread/_pthread_cond_t.h>
-
-
-
-#define COPY_A 0
-#define COPY_B 1
-
-
-typedef struct{
-    uintptr_t copyA;
-    uintptr_t copyB;
-    int readable_copy; //Indique quelle copie est lisible (AouB)
-    bool already_written; 
-    _Atomic uint64_t access_set;
-}Word;
-
-struct transaction {
-    uint64_t epoch;
-    bool is_ro;
-    bool aborted;
-    // Write set for the transaction
-    struct write_entry* write_set_head;
-    struct write_entry* write_set_tail;
-    // Allocation and deallocation lists
-    struct segment_node* alloc_segments;
-    struct segment_node* free_segments;
-    // Other fields as needed
-};
-
-struct batcher_str {
-    uint64_t epoch;
-    _Atomic uint64_t transaction_count;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    
-};
-
-struct write_entry {
-    size_t word_index;          // Index of the word in the versions array
-    uintptr_t value;            // Value to write
-    struct write_entry* next;   // Next write entry
-};
-
-struct commit_list_t {
-    struct write_entry* head;    // Head of the combined write sets
-    struct write_entry* tail;    // Tail of the combined write sets
-};
-
-struct region {
-    Word* word;
-    size_t word_count; //Nombre de mot dans la sharded memory region
-    size_t size;        
-    size_t align;  
-    uint64_t epoch;
-    struct batcher_str batcher;
-    struct commit_list_t commit_list;
-    struct segment_node* allocated_segments;
-};
-
-struct segment_node {
-    void* segment;
-    size_t size;
-    struct segment_node* next;
-};
+#include <string.h>
 
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.

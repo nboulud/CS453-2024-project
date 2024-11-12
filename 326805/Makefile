@@ -7,6 +7,7 @@ EXT_CXX  := C cc cpp cxx c++
 
 INCLUDE_DIR := ../include
 SOURCE_DIR  := .
+TEST_SRC := ./tests/tm_test.c  # Adjust this to where tm_test.c is located
 
 WILD_EXT  = $(strip $(foreach EXT,$($(1)),$(wildcard $(2)/*.$(EXT))))
 
@@ -16,19 +17,24 @@ SRCS_C   := $(call WILD_EXT,EXT_C,$(SOURCE_DIR))
 SRCS_CXX := $(call WILD_EXT,EXT_CXX,$(SOURCE_DIR))
 OBJS     := $(SRCS_C:%=%.o) $(SRCS_CXX:%=%.o)
 
+# Test-related settings
+TEST_OBJ := $(TEST_SRC:.c=.o)
+TEST_EXEC := tm_test
+
 CC       := $(CC)
-CCFLAGS  := -Wall -Wextra -Wfatal-errors -O2 -std=c11 -fPIC -I$(INCLUDE_DIR)
+CCFLAGS  := -Wall -Wextra -Wfatal-errors -O0 -std=c11 -fPIC -g -I$(INCLUDE_DIR)  # Use -O0 instead of -O2
 CXX      := $(CXX)
-CXXFLAGS := -Wall -Wextra -Wfatal-errors -O2 -std=c++17 -fPIC -I$(INCLUDE_DIR)
+CXXFLAGS := -Wall -Wextra -Wfatal-errors -O0 -std=c++17 -fPIC -g -I$(INCLUDE_DIR)  # Use -O0 instead of -O2
 LD       := $(if $(SRCS_CXX),$(CXX),$(CC))
 LDFLAGS  := -shared
-LDLIBS   :=
+LDLIBS   := -lm -lpthread
 
-.PHONY: build clean
+.PHONY: build clean run_test
 
-build: $(BIN)
+build: $(BIN) $(TEST_EXEC)
+
 clean:
-	$(RM) $(OBJS) $(BIN)
+	$(RM) $(OBJS) $(BIN) $(TEST_OBJ) $(TEST_EXEC)
 
 define BUILD_C
 %.$(1).o: %.$(1) $$(HDRS_C) Makefile
@@ -43,4 +49,14 @@ endef
 $(foreach EXT,$(EXT_CXX),$(eval $(call BUILD_CXX,$(EXT))))
 
 $(BIN): $(OBJS) Makefile
-	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
+	$(LD) $(LDFLAGS) -g -o $@ $(OBJS) $(LDLIBS)
+
+# Compile and link tm_test.c
+$(TEST_OBJ): $(TEST_SRC) $(HDRS_C)
+	$(CC) $(CCFLAGS) -c -o $@ $<
+
+$(TEST_EXEC): $(TEST_OBJ) $(OBJS)
+	$(CC) $(CCFLAGS) -g -o $@ $(TEST_OBJ) $(OBJS) $(LDLIBS)
+
+run_test: $(TEST_EXEC)
+	ulimit -c unlimited && ./$(TEST_EXEC)  # Allow core dumps to be generated
