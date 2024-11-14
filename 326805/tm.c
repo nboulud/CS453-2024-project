@@ -62,7 +62,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align)) {
         reg->word[i].copyB = 0;
         reg->word[i].readable_copy = COPY_A;
         reg->word[i].already_written = false;
-        reg->word[i].access_set = 0; 
+        reg->word[i].owner = NULL; 
     }
     
     init_batcher(&reg->batcher);
@@ -234,43 +234,42 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         }
     }
 
-    size_t num_words = size / reg->align;
+    // Calculate the number of words to read, rounding up to cover the entire size
+    size_t num_words = (size + reg->align - 1) / reg->align;
     if (word_index + num_words > word_array_size) {
         // Attempting to read beyond the segment
         txt->aborted = true;
         return false;
     }
 
-    for (size_t i = 0; i < num_words; i++) {
+    size_t bytes_copied = 0;
+    for (size_t i = 0; i < num_words && bytes_copied < size; i++) {
         Word* word_t = &word_array[word_index + i];
 
-        if (atomic_load(&word_t->access_set) != 0 && !transaction_in_access_set(word_t, txt) && !txt->is_ro) {
+        // Conflict detection
+        if (word_t->owner != NULL && word_t->owner != txt && !txt->is_ro) {
             txt->aborted = true;
             return false;
         }
-        if (txt->is_ro) {
-            if (word_t->readable_copy == COPY_A) {
-                ((uintptr_t*) target)[i] = word_t->copyA;
-            } else {
-                ((uintptr_t*) target)[i] = word_t->copyB;
-            }
+
+        uintptr_t word_value;
+        if (txt->is_ro || !word_t->already_written || word_t->owner != txt) {
+            // Read from the readable copy
+            word_value = (word_t->readable_copy == COPY_A) ? word_t->copyA : word_t->copyB;
         } else {
-            if (word_t->already_written) {
-                if (transaction_in_access_set(word_t, txt)) {
-                    ((uintptr_t*) target)[i] = get_writable_copy(word_t, txt);
-                } else {
-                    txt->aborted = true;
-                    return false;
-                }
-            } else {
-                if (word_t->readable_copy == COPY_A) {
-                    ((uintptr_t*) target)[i] = word_t->copyA;
-                } else {
-                    ((uintptr_t*) target)[i] = word_t->copyB;
-                }
-                add_transaction_to_access_set(word_t, txt);
-            }
+            // Read from the writable copy
+            word_value = get_writable_copy(word_t, txt);
         }
+
+        // Calculate the number of bytes to copy for this word
+        size_t bytes_to_copy = reg->align;
+        if (bytes_copied + bytes_to_copy > size) {
+            bytes_to_copy = size - bytes_copied;
+        }
+
+        // Copy the word value into the target buffer
+        memcpy((char*)target + bytes_copied, &word_value, bytes_to_copy);
+        bytes_copied += bytes_to_copy;
     }
     return true;
 }
@@ -321,41 +320,49 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
         }
     }
 
-    size_t num_words = size / reg->align;
+    // Calculate the number of words to write, rounding up to cover the entire size
+    size_t num_words = (size + reg->align - 1) / reg->align;
     if (word_index + num_words > word_array_size) {
         // Attempting to write beyond the segment
         txt->aborted = true;
         return false;
     }
 
-    for (size_t i = 0; i < num_words; i++) {
+    size_t bytes_copied = 0;
+    for (size_t i = 0; i < num_words && bytes_copied < size; i++) {
         Word* word_t = &word_array[word_index + i];
         uintptr_t current_addr = addr + i * reg->align;
 
-        if (atomic_load(&word_t->access_set) != 0) {
+        // Conflict detection
+        if (word_t->owner != NULL && word_t->owner != txt) {
             txt->aborted = true;
             return false;
         }
-        if (word_t->already_written) {
-            if (transaction_in_access_set(word_t, txt)) {
-                // Update the writable copy
-                set_writable_copy(word_t, txt, ((uintptr_t*) source)[i]);
-            } else {
-                txt->aborted = true;
-                return false;
-            }
-        } else {
-            if (access_set_not_empty(word_t)) {
-                txt->aborted = true;
-                return false;
-            } else {
-                // First time this word is being written by this transaction
-                set_writable_copy(word_t, txt, ((uintptr_t*) source)[i]);
-                add_transaction_to_access_set(word_t, txt);
-                word_t->already_written = true;
 
-                // **Add the write to the transaction's write set**
-                add_write_entry(txt, current_addr, ((uintptr_t*) source)[i]);
+        // Read data from source
+        uintptr_t word_value = 0;
+        size_t bytes_to_copy = reg->align;
+        if (bytes_copied + bytes_to_copy > size) {
+            bytes_to_copy = size - bytes_copied;
+        }
+        memcpy(&word_value, (char*)source + bytes_copied, bytes_to_copy);
+        bytes_copied += bytes_to_copy;
+
+        // Set the writable copy
+        if (!word_t->already_written) {
+            set_writable_copy(word_t, txt, word_value);
+            add_transaction_to_access_set(word_t, txt);
+            word_t->already_written = true;
+
+            // Add the write to the transaction's write set
+            add_write_entry(txt, current_addr, word_value);
+        } else {
+            if (word_t->owner == txt) {
+                // Update the writable copy
+                set_writable_copy(word_t, txt, word_value);
+            } else {
+                txt->aborted = true;
+                return false;
             }
         }
     }
@@ -384,7 +391,7 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
         new_word[i].copyB = 0;
         new_word[i].readable_copy = COPY_A;
         new_word[i].already_written = false;
-        new_word[i].access_set = 0;
+        new_word[i].owner = NULL;
     }
     struct transaction* txt = (struct transaction*) tx;
     add_allocated_segment(reg,txt, new_word, word_count);
@@ -620,7 +627,7 @@ void perform_epoch_commit(struct region* reg) {
     // Reset the initial segment
     for (size_t i = 0; i < reg->word_count; i++) {
         reg->word[i].already_written = false;
-        reg->word[i].access_set = 0;
+        reg->word[i].owner = NULL;
     }
 
     // Reset flags in other allocated segments
@@ -630,7 +637,7 @@ void perform_epoch_commit(struct region* reg) {
         size_t word_count = node->size / sizeof(Word);
         for (size_t i = 0; i < word_count; i++) {
             word_array[i].already_written = false;
-            word_array[i].access_set = 0;
+            word_array[i].owner = NULL;
         }
         node = node->next;
     }
@@ -638,8 +645,7 @@ void perform_epoch_commit(struct region* reg) {
 
 bool transaction_in_access_set(Word* word, struct transaction* tx) {
     // Let's assume each transaction has a unique ID (e.g., pointer value)
-    uint64_t tx_id = (uint64_t)(uintptr_t) tx;
-    return (word->access_set & tx_id) != 0;
+    return word->owner == tx;
 }
 
 uintptr_t get_writable_copy(Word* word, struct transaction* tx) {
@@ -652,8 +658,7 @@ uintptr_t get_writable_copy(Word* word, struct transaction* tx) {
 }
 
 void add_transaction_to_access_set(Word* word, struct transaction* tx) {
-    uint64_t tx_id = (uint64_t)(uintptr_t) tx;
-    word->access_set |= tx_id;
+    word->owner = tx;
 }
 
 void set_writable_copy(Word* word, struct transaction* tx, uintptr_t value) {
@@ -666,7 +671,7 @@ void set_writable_copy(Word* word, struct transaction* tx, uintptr_t value) {
 }
 
 bool access_set_not_empty(Word* word) {
-    return word->access_set != 0;
+    return word->owner != NULL;
 }
 
 void add_allocated_segment(struct region* reg, struct transaction* tx, Word* segment, size_t word_count) {

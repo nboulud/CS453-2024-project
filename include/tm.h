@@ -71,7 +71,7 @@ typedef struct Word{
     uintptr_t copyB;
     int readable_copy; //Indique quelle copie est lisible (AouB)
     bool already_written; 
-    _Atomic uint64_t access_set;
+    struct transaction* owner;
 }Word;
 
 typedef struct transaction {
