@@ -97,6 +97,7 @@ typedef struct batcher_str {
 typedef struct write_entry {
     size_t word_index;          // Index of the word in the versions array
     uintptr_t value;            // Value to write
+    uintptr_t address;
     struct write_entry* next;   // Next write entry
 } write_entry;
 
@@ -114,12 +115,15 @@ typedef struct region {
     struct batcher_str batcher;
     struct commit_list_t commit_list;
     struct segment_node* allocated_segments;
+    pthread_mutex_t alloc_segments_mutex;
 }region;
 
 typedef struct segment_node {
     void* segment;
     size_t size;
-    struct segment_node* next;
+    struct segment_node* next;        // Next in the region's list
+    struct segment_node* next_in_tx;  // Next in the transaction's list
+    bool to_be_freed;   
 }segment_node;
 
 
@@ -131,7 +135,7 @@ void enter_batcher(struct batcher_str* batcher);
 uint64_t get_current_epoch(struct batcher_str* batcher);
 bool leave_batcher(struct batcher_str* batcher);
 void init_rw_sets(struct transaction* tx);
-void cleanup_transaction(struct transaction* tx);
+void cleanup_transaction(struct transaction* tx, struct region* reg);
 void add_to_commit_list(struct commit_list_t* clist, struct transaction* tx);
 void perform_epoch_commit(struct region* reg);
 bool transaction_in_access_set(Word* word, struct transaction* tx);
@@ -139,5 +143,6 @@ uintptr_t get_writable_copy(Word* word, struct transaction* tx);
 void add_transaction_to_access_set(Word* word, struct transaction* tx);
 void set_writable_copy(Word* word, struct transaction* tx, uintptr_t value);
 bool access_set_not_empty(Word* word);
-void add_allocated_segment(struct transaction* tx, Word* segment, size_t word_count);
-void add_deallocation(struct transaction* tx, void* target);
+void add_allocated_segment(struct region* reg,struct transaction* tx, Word* segment, size_t word_count);
+void add_deallocation(struct transaction* tx, struct segment_node* node);
+void add_write_entry(struct transaction* tx, uintptr_t address, uintptr_t value);
