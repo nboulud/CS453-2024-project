@@ -94,7 +94,7 @@ typedef struct batcher_str {
     _Atomic uint64_t transaction_count;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
-    bool committing;                
+    bool committing;
     struct timespec batch_start_time;
     unsigned int batch_transaction_count;
 } batcher_str;

@@ -16,6 +16,10 @@
 // Requested features
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE   200809L
+#define COPY_A 0
+#define COPY_B 1
+#define BATCH_SIZE 100               // Maximum number of transactions in a batch
+#define BATCH_TIMEOUT_MS 100
 #ifdef __STDC_NO_ATOMICS__
     #error Current C11 compiler does not support atomic operations
 #endif
@@ -587,6 +591,12 @@ void perform_epoch_commit(struct region_c* reg) {
 
     struct batcher_str* batcher = &reg->batcher;
     pthread_mutex_lock(&batcher->mutex);
+    batcher->committing = false;
+    batcher->batch_transaction_count = 0;
+    clock_gettime(CLOCK_MONOTONIC, &batcher->batch_start_time);
+    batcher->epoch++;
+    pthread_cond_broadcast(&batcher->cond);
+    pthread_mutex_unlock(&batcher->mutex);
 
     struct write_entry* entry = reg->commit_list.head;
 
@@ -695,18 +705,7 @@ void perform_epoch_commit(struct region_c* reg) {
         node = node->next;
     }
 
-    // Reset batcher state
-    batcher->committing = false;
-    batcher->batch_transaction_count = 0;
-    clock_gettime(CLOCK_MONOTONIC, &batcher->batch_start_time);
 
-    // Increment the epoch
-    batcher->epoch++;
-
-    // Wake up any waiting threads
-    pthread_cond_broadcast(&batcher->cond);
-
-    pthread_mutex_unlock(&batcher->mutex);
 }
 
 bool transaction_in_access_set(Word* word, struct transaction* tx) {
