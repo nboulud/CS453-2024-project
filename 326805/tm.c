@@ -47,6 +47,7 @@
 shared_t tm_create(size_t unused(size), size_t unused(align)) {
     struct region_c* reg = malloc(sizeof(struct region_c));
     if(!reg) return invalid_shared;
+    printf("TM_CREATE begin %ld, %d \n",size , align);
 
     memset(reg, 0, sizeof(struct region_c));
 
@@ -76,6 +77,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align)) {
     reg->align = align;
     reg->size = size;
 
+    printf("TM_CREATE return region \n");
     return reg;
 }
 
@@ -85,6 +87,8 @@ shared_t tm_create(size_t unused(size), size_t unused(align)) {
 void tm_destroy(shared_t unused(shared)) {
 
     struct region_c* reg = (struct region_c*) shared;
+
+    printf("TM_DESTROY begin %p \n",shared);
 
     wait_for_no_transactions(&reg->batcher);
     pthread_mutex_destroy(&reg->alloc_segments_mutex);
@@ -99,7 +103,9 @@ void tm_destroy(shared_t unused(shared)) {
  * @return Start address of the first allocated segment
 **/
 void* tm_start(shared_t unused(shared)) {
+    printf("TM_START begin %p \n",shared);
     struct region_c* reg = (struct region_c*) shared;
+    printf("TM_START return correctly \n");
     return (void*) reg->word;
 }
 
@@ -108,7 +114,9 @@ void* tm_start(shared_t unused(shared)) {
  * @return First allocated segment size
 **/
 size_t tm_size(shared_t unused(shared)) {
+    printf("TM_SIZE begin %p \n",shared);
     struct region_c* reg = (struct region_c*) shared;
+    printf("TM_SIZE return correctly\n");
     return reg->size;
 }
 
@@ -117,7 +125,9 @@ size_t tm_size(shared_t unused(shared)) {
  * @return Alignment used globally
 **/
 size_t tm_align(shared_t unused(shared)) {
+    printf("TM_ALIGN begin %p \n",shared);
     struct region_c* reg = (struct region_c*) shared;
+    printf("TM_ALIGN return %ld \n",reg->align);
     return reg->align;
 }
 
@@ -128,6 +138,8 @@ size_t tm_align(shared_t unused(shared)) {
 **/
 tx_t tm_begin(shared_t unused(shared), bool unused(is_ro)) {
 
+    //printf("TM_BEGIN begin (1 is read only)  %d \n", is_ro);
+
     struct region_c* reg = (struct region_c*) shared;
 
     enter_batcher(&reg->batcher);
@@ -137,6 +149,7 @@ tx_t tm_begin(shared_t unused(shared), bool unused(is_ro)) {
     struct transaction* tx = malloc(sizeof(struct transaction));
     if (!tx) {
         leave_batcher(&reg->batcher);
+        printf("TM_BEGIN return invalid_tx \n");
         return invalid_tx;
     }
 
@@ -151,6 +164,7 @@ tx_t tm_begin(shared_t unused(shared), bool unused(is_ro)) {
         init_rw_sets(tx);
     }
 
+    //printf("TM_BEGIN return correctly \n");
     return (tx_t)(uintptr_t)tx;
     
 }
@@ -166,10 +180,13 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
 
     struct transaction* txt = (struct transaction*) tx;
 
+    //printf("TM_END begin %d, %p \n",shared, txt);
+
     if (txt->aborted) {
         // Transaction aborted, clean up
         cleanup_transaction(txt, reg);
         leave_batcher(&reg->batcher);
+        printf("TM_END return false (txt->aborted) \n");
         return false;
     } else {
         if (!txt->is_ro) {
@@ -185,7 +202,7 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
         }
 
         cleanup_transaction(txt, reg);
-
+        //printf("TM_END return true \n");
         return true;
     }
 
@@ -203,6 +220,7 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
 bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
     struct region_c* reg = (struct region_c*) shared;
     struct transaction* txt = (struct transaction*) tx;
+    //printf("TM_READ begin, %p, %p, %d, %p\n", txt, source, size ,target);
     uintptr_t addr = (uintptr_t) source;
     Word* word_array = NULL;
     size_t word_array_size = 0;
@@ -234,6 +252,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         if (!found) {
             // Address not found in any segment
             txt->aborted = true;
+            printf("TM_READ return false (txt->aborted, Address not found in any segment) \n");
             return false;
         }
     }
@@ -243,6 +262,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     if (word_index + num_words > word_array_size) {
         // Attempting to read beyond the segment
         txt->aborted = true;
+        printf("TM_READ return false (txt->aborted, Attempting to read beyond the segment) \n");
         return false;
     }
 
@@ -253,6 +273,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         // Conflict detection
         if (word_t->owner != NULL && word_t->owner != txt && !txt->is_ro) {
             txt->aborted = true;
+            printf("TM_READ return false (txt->aborted, Conflict detection) \n");
             return false;
         }
 
@@ -262,7 +283,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
             word_value = (word_t->readable_copy == COPY_A) ? word_t->copyA : word_t->copyB;
         } else {
             // Read from the writable copy
-            word_value = get_writable_copy(word_t, txt);
+            word_value = get_writable_copy(word_t);
         }
 
         // Calculate the number of bytes to copy for this word
@@ -275,6 +296,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         memcpy((char*)target + bytes_copied, &word_value, bytes_to_copy);
         bytes_copied += bytes_to_copy;
     }
+    //printf("TM_READ return true \n");
     return true;
 }
 
@@ -289,6 +311,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
 bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
     struct region_c* reg = (struct region_c*) shared;
     struct transaction* txt = (struct transaction*) tx;
+    //printf("TM_WRITE begin, %p, %p, %d, %p\n", txt, source, size ,target);
     uintptr_t addr = (uintptr_t) target;
     Word* word_array = NULL;
     size_t word_array_size = 0;
@@ -320,6 +343,7 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
         if (!found) {
             // Address not found in any segment
             txt->aborted = true;
+            printf("TM_WRITE return false (txt->aborted, Address not found in any segment) \n");
             return false;
         }
     }
@@ -329,6 +353,7 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
     if (word_index + num_words > word_array_size) {
         // Attempting to write beyond the segment
         txt->aborted = true;
+        printf("TM_WRITE return false (txt->aborted, Attempting to read beyond the segment) \n");
         return false;
     }
 
@@ -340,6 +365,9 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
         // Conflict detection
         if (word_t->owner != NULL && word_t->owner != txt) {
             txt->aborted = true;
+            printf("TM_WRITE return false (txt->aborted, Conflict Detected) owner : %p , txt : %p  \n", word_t->owner, txt);
+            cleanup_transaction(txt, reg);
+            leave_batcher(&reg->batcher);
             return false;
         }
 
@@ -354,7 +382,7 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
 
         // Set the writable copy
         if (!word_t->already_written) {
-            set_writable_copy(word_t, txt, word_value);
+            set_writable_copy(word_t, word_value);
             add_transaction_to_access_set(word_t, txt);
             word_t->already_written = true;
 
@@ -363,13 +391,15 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
         } else {
             if (word_t->owner == txt) {
                 // Update the writable copy
-                set_writable_copy(word_t, txt, word_value);
+                set_writable_copy(word_t, word_value);
             } else {
                 txt->aborted = true;
+                printf("TM_WRITE return false (txt->aborted, Conflict Detected 2) \n");
                 return false;
             }
         }
     }
+    //printf("TM_WRITE return true \n");
     return true;
 }
 
@@ -383,10 +413,13 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
 alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), void** unused(target)) {
 
     struct region_c* reg = (struct region_c*) shared;
+    struct transaction* txt = (struct transaction*) tx;
+    printf("TM_ALLOC begin %p, %d, %p  \n", txt, size, target);
     
     size_t word_count = size / reg->align;
     Word* new_word = malloc(sizeof(Word) * word_count);
     if (!new_word) {
+        printf("TM_ALLOC return nomem_alloc \n");
         return nomem_alloc;
     }
 
@@ -397,10 +430,11 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
         new_word[i].already_written = false;
         new_word[i].owner = NULL;
     }
-    struct transaction* txt = (struct transaction*) tx;
+    
     add_allocated_segment(reg,txt, new_word, word_count);
 
     *target = (void*) new_word;
+    printf("TM_ALLOC return succes_alloc \n");
     return success_alloc;
 }
     
@@ -415,6 +449,8 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
 bool tm_free(shared_t unused(shared), tx_t unused(tx), void* unused(target)) {
     struct region_c* reg = (struct region_c*) shared;
     struct transaction* txt = (struct transaction*) tx;
+
+    printf("TM_FREE begin %p, %p \n", txt, target);
 
     // Lock the mutex before accessing allocated_segments
     pthread_mutex_lock(&reg->alloc_segments_mutex);
@@ -434,6 +470,7 @@ bool tm_free(shared_t unused(shared), tx_t unused(tx), void* unused(target)) {
         // Invalid free operation
         pthread_mutex_unlock(&reg->alloc_segments_mutex);
         txt->aborted = true;
+        printf("TM_FREE return false (Invalid free operation) \n");
         return false;
     }
 
@@ -446,6 +483,7 @@ bool tm_free(shared_t unused(shared), tx_t unused(tx), void* unused(target)) {
     // Add to transaction's free_segments list
     add_deallocation(txt, target_node);
 
+    printf("TM_FREE return true \n");
     return true;
 }
 
@@ -547,11 +585,55 @@ void init_rw_sets(struct transaction* tx) {
 void cleanup_transaction(struct transaction* tx, struct region_c* reg) {
     struct write_entry* entry = tx->write_set_head;
     while (entry) {
+        // Reset the word's owner and already_written fields
+        Word* word = NULL;
+        uintptr_t addr = entry->address;
+
+        // Determine the segment the address belongs to
+        Word* word_array = NULL;
+        size_t index_in_segment = 0;
+
+        uintptr_t reg_start = (uintptr_t) reg->word;
+        uintptr_t reg_end = reg_start + reg->word_count * reg->align;
+        if (addr >= reg_start && addr < reg_end) {
+            // Address in the initial segment
+            word_array = reg->word;
+            index_in_segment = (addr - reg_start) / reg->align;
+        } else {
+            // Search in allocated segments
+            segment_node_c* node = reg->allocated_segments;
+            bool found = false;
+            while (node) {
+                uintptr_t seg_start = (uintptr_t) node->segment;
+                uintptr_t seg_end = seg_start + node->size;
+                if (addr >= seg_start && addr < seg_end) {
+                    word_array = (Word*) node->segment;
+                    index_in_segment = (addr - seg_start) / reg->align;
+                    found = true;
+                    break;
+                }
+                node = node->next;
+            }
+            if (!found) {
+                // Address not found, skip
+                struct write_entry* next = entry->next;
+                free(entry);
+                entry = next;
+                continue;
+            }
+        }
+        word = &word_array[index_in_segment];
+        word->owner = NULL;
+        word->already_written = false;
+
         struct write_entry* next = entry->next;
         free(entry);
         entry = next;
     }
+    tx->write_set_head = NULL;
+    tx->write_set_tail = NULL;
 
+    // Handle allocated segments
     if (tx->aborted) {
         // Mark allocated segments for deallocation
         segment_node_c* node = tx->alloc_segments;
@@ -611,7 +693,7 @@ void perform_epoch_commit(struct region_c* reg) {
 
         uintptr_t reg_start = (uintptr_t) reg->word;
         uintptr_t reg_end = reg_start + reg->word_count * reg->align;
-        
+
         if (addr >= reg_start && addr < reg_end) {
             // Address in the initial segment
             word_array = reg->word;
@@ -639,11 +721,18 @@ void perform_epoch_commit(struct region_c* reg) {
 
         // Apply the write
         word = &word_array[index_in_segment];
+        // Write the new value into the non-readable copy
         if (word->readable_copy == COPY_A) {
+            word->copyB = entry->value;
             atomic_store(&word->readable_copy, COPY_B);
         } else {
+            word->copyA = entry->value;
             atomic_store(&word->readable_copy, COPY_A);
         }
+
+        // Reset the owner and already_written fields
+        word->owner = NULL;
+        word->already_written = false;
 
         // Free the write entry after applying it
         struct write_entry* next_entry = entry->next;
@@ -655,10 +744,9 @@ void perform_epoch_commit(struct region_c* reg) {
     reg->commit_list.head = NULL;
     reg->commit_list.tail = NULL;
 
-    // Lock for deallocating segments safely
+    // Handle deallocations for segments marked as 'to_be_freed'
     pthread_mutex_lock(&reg->alloc_segments_mutex);
 
-    // Handle deallocations for segments marked as 'to_be_freed'
     segment_node_c** current = &reg->allocated_segments;
     while (*current) {
         segment_node_c* node = *current;
@@ -685,27 +773,6 @@ void perform_epoch_commit(struct region_c* reg) {
     // Update the epoch for the next round of transactions
     reg->epoch++;
 
-    // Reset flags in all segments
-
-    // Reset the initial segment
-    for (size_t i = 0; i < reg->word_count; i++) {
-        reg->word[i].already_written = false;
-        reg->word[i].owner = NULL;
-    }
-
-    // Reset flags in other allocated segments
-    segment_node_c* node = reg->allocated_segments;
-    while (node) {
-        Word* word_array = (Word*) node->segment;
-        size_t word_count = node->size / sizeof(Word);
-        for (size_t i = 0; i < word_count; i++) {
-            word_array[i].already_written = false;
-            word_array[i].owner = NULL;
-        }
-        node = node->next;
-    }
-
-
 }
 
 bool transaction_in_access_set(Word* word, struct transaction* tx) {
@@ -713,7 +780,7 @@ bool transaction_in_access_set(Word* word, struct transaction* tx) {
     return word->owner == tx;
 }
 
-uintptr_t get_writable_copy(Word* word, struct transaction* tx) {
+uintptr_t get_writable_copy(Word* word) {
     // Assuming transactions write to copyB when readable_copy is COPY_A
     if (word->readable_copy == COPY_A) {
         return word->copyB;
@@ -726,7 +793,7 @@ void add_transaction_to_access_set(Word* word, struct transaction* tx) {
     word->owner = tx;
 }
 
-void set_writable_copy(Word* word, struct transaction* tx, uintptr_t value) {
+void set_writable_copy(Word* word, uintptr_t value) {
     // Assuming transactions write to copyB when readable_copy is COPY_A
     if (word->readable_copy == COPY_A) {
         word->copyB = value;

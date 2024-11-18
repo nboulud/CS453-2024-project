@@ -84,8 +84,8 @@ typedef struct transaction {
     struct write_entry* write_set_head;
     struct write_entry* write_set_tail;
     // Allocation and deallocation lists
-    struct segment_node* alloc_segments;
-    struct segment_node* free_segments;
+    struct segment_node_c* alloc_segments;
+    struct segment_node_c* free_segments;
     // Other fields as needed
 } transaction;
 
@@ -119,15 +119,15 @@ typedef struct region_c {
     uint64_t epoch;
     struct batcher_str batcher;
     struct commit_list_t commit_list;
-    struct segment_node* allocated_segments;
+    struct segment_node_c* allocated_segments;
     pthread_mutex_t alloc_segments_mutex;
 }region_c;
 
 typedef struct segment_node_c {
     void* segment;
     size_t size;
-    struct segment_node* next;        // Next in the region's list
-    struct segment_node* next_in_tx;  // Next in the transaction's list
+    struct segment_node_c* next;        // Next in the region's list
+    struct segment_node_c* next_in_tx;  // Next in the transaction's list
     bool to_be_freed;   
 }segment_node_c;
 
@@ -144,9 +144,9 @@ void cleanup_transaction(struct transaction* tx, struct region_c* reg);
 void add_to_commit_list(struct commit_list_t* clist, struct transaction* tx);
 void perform_epoch_commit(struct region_c* reg);
 bool transaction_in_access_set(Word* word, struct transaction* tx);
-uintptr_t get_writable_copy(Word* word, struct transaction* tx);
+uintptr_t get_writable_copy(Word* word);
 void add_transaction_to_access_set(Word* word, struct transaction* tx);
-void set_writable_copy(Word* word, struct transaction* tx, uintptr_t value);
+void set_writable_copy(Word* word, uintptr_t value);
 bool access_set_not_empty(Word* word);
 void add_allocated_segment(struct region_c* reg,struct transaction* tx, Word* segment, size_t word_count);
 void add_deallocation(struct transaction* tx, struct segment_node_c* node);
