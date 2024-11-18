@@ -128,7 +128,7 @@ tx_t tm_begin(shared_t unused(shared), bool unused(is_ro)) {
 
     enter_batcher(&reg->batcher);
 
-    uint64_t epoch = get_current_epoch(&reg->batcher);
+    uint64_t epoch = reg->batcher.epoch;
 
     struct transaction* tx = malloc(sizeof(struct transaction));
     if (!tx) {
@@ -148,7 +148,6 @@ tx_t tm_begin(shared_t unused(shared), bool unused(is_ro)) {
     }
 
     return (tx_t)(uintptr_t)tx;
-    //return tx;
     
 }
 
@@ -174,10 +173,9 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
             add_to_commit_list(&reg->commit_list, txt);
         }
 
-        // Leave the batcher
-        bool last_in_epoch = leave_batcher(&reg->batcher);
+        bool should_commit = leave_batcher(&reg->batcher);
 
-        if (last_in_epoch) {
+        if (should_commit) {
             // Perform epoch commit
             perform_epoch_commit(reg);
         }
@@ -455,6 +453,9 @@ void init_batcher(struct batcher_str* batcher) {
     atomic_init(&batcher->transaction_count, 0);
     pthread_mutex_init(&batcher->mutex, NULL);
     pthread_cond_init(&batcher->cond, NULL);
+    batcher->committing = false;
+    batcher->batch_transaction_count = 0;
+    clock_gettime(CLOCK_MONOTONIC, &batcher->batch_start_time);
 }
 
 void wait_for_no_transactions(struct batcher_str* batcher) {
@@ -471,7 +472,23 @@ void cleanup_batcher(struct batcher_str* batcher) {
 }
 
 void enter_batcher(struct batcher_str* batcher) {
+    pthread_mutex_lock(&batcher->mutex);
+
+    // Wait if a commit is in progress
+    while (batcher->committing) {
+        pthread_cond_wait(&batcher->cond, &batcher->mutex);
+    }
+
+    // Increment transaction counts
     atomic_fetch_add(&batcher->transaction_count, 1);
+    batcher->batch_transaction_count++;
+
+    // If this is the first transaction in the batch, record the start time
+    if (batcher->batch_transaction_count == 1) {
+        clock_gettime(CLOCK_MONOTONIC, &batcher->batch_start_time);
+    }
+
+    pthread_mutex_unlock(&batcher->mutex);
 }
 
 uint64_t get_current_epoch(struct batcher_str* batcher) {
@@ -479,14 +496,41 @@ uint64_t get_current_epoch(struct batcher_str* batcher) {
 }
 
 bool leave_batcher(struct batcher_str* batcher) {
-    if (atomic_fetch_sub(&batcher->transaction_count, 1) == 1) {
-        // This was the last transaction
-        pthread_mutex_lock(&batcher->mutex);
-        pthread_cond_broadcast(&batcher->cond);
-        pthread_mutex_unlock(&batcher->mutex);
-        return true;
+    pthread_mutex_lock(&batcher->mutex);
+
+    atomic_fetch_sub(&batcher->transaction_count, 1);
+    batcher->batch_transaction_count--;
+
+    bool should_commit = false;
+
+    // Check if commit conditions are met
+    if (batcher->batch_transaction_count == 0) {
+        // All transactions in the batch have finished
+        should_commit = true;
+    } else if (batcher->batch_transaction_count >= BATCH_SIZE) {
+        // Batch size limit reached
+        should_commit = true;
+    } else {
+        // Check if batch timeout has been exceeded
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        uint64_t elapsed_ms = (now.tv_sec - batcher->batch_start_time.tv_sec) * 1000 +
+                              (now.tv_nsec - batcher->batch_start_time.tv_nsec) / 1000000;
+
+        if (elapsed_ms >= BATCH_TIMEOUT_MS) {
+            should_commit = true;
+        }
     }
-    return false;
+
+    if (should_commit && !batcher->committing) {
+        // Set committing flag and wake up any waiting threads
+        batcher->committing = true;
+        pthread_cond_broadcast(&batcher->cond);
+    }
+
+    pthread_mutex_unlock(&batcher->mutex);
+
+    return should_commit;
 }
 
 void init_rw_sets(struct transaction* tx) {
@@ -540,6 +584,10 @@ void add_to_commit_list(struct commit_list_t* clist, struct transaction* tx) {
 
 
 void perform_epoch_commit(struct region_c* reg) {
+
+    struct batcher_str* batcher = &reg->batcher;
+    pthread_mutex_lock(&batcher->mutex);
+
     struct write_entry* entry = reg->commit_list.head;
 
     // Apply the writes and free each entry after use
@@ -646,6 +694,19 @@ void perform_epoch_commit(struct region_c* reg) {
         }
         node = node->next;
     }
+
+    // Reset batcher state
+    batcher->committing = false;
+    batcher->batch_transaction_count = 0;
+    clock_gettime(CLOCK_MONOTONIC, &batcher->batch_start_time);
+
+    // Increment the epoch
+    batcher->epoch++;
+
+    // Wake up any waiting threads
+    pthread_cond_broadcast(&batcher->cond);
+
+    pthread_mutex_unlock(&batcher->mutex);
 }
 
 bool transaction_in_access_set(Word* word, struct transaction* tx) {
@@ -720,3 +781,6 @@ void add_write_entry(struct transaction* tx, uintptr_t address, uintptr_t value)
     tx->write_set_tail = entry;
 }
 
+void get_current_time(struct timespec* ts) {
+    clock_gettime(CLOCK_MONOTONIC, ts);
+}

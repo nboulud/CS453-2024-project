@@ -65,6 +65,8 @@ bool     tm_free(shared_t, tx_t, void*);
 
 #define COPY_A 0
 #define COPY_B 1
+#define BATCH_SIZE 100               // Maximum number of transactions in a batch
+#define BATCH_TIMEOUT_MS 100
 
 typedef struct Word{
     uintptr_t copyA;
@@ -92,6 +94,9 @@ typedef struct batcher_str {
     _Atomic uint64_t transaction_count;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
+    bool committing;                
+    struct timespec batch_start_time;
+    unsigned int batch_transaction_count;
 } batcher_str;
 
 typedef struct write_entry {
