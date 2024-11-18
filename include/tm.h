@@ -106,7 +106,7 @@ typedef struct commit_list_t {
     struct write_entry* tail;    // Tail of the combined write sets
 } commit_list_t;
 
-typedef struct region {
+typedef struct region_c {
     Word* word;
     size_t word_count; //Nombre de mot dans la sharded memory region
     size_t size;        
@@ -116,15 +116,15 @@ typedef struct region {
     struct commit_list_t commit_list;
     struct segment_node* allocated_segments;
     pthread_mutex_t alloc_segments_mutex;
-}region;
+}region_c;
 
-typedef struct segment_node {
+typedef struct segment_node_c {
     void* segment;
     size_t size;
     struct segment_node* next;        // Next in the region's list
     struct segment_node* next_in_tx;  // Next in the transaction's list
     bool to_be_freed;   
-}segment_node;
+}segment_node_c;
 
 
 
@@ -135,14 +135,14 @@ void enter_batcher(struct batcher_str* batcher);
 uint64_t get_current_epoch(struct batcher_str* batcher);
 bool leave_batcher(struct batcher_str* batcher);
 void init_rw_sets(struct transaction* tx);
-void cleanup_transaction(struct transaction* tx, struct region* reg);
+void cleanup_transaction(struct transaction* tx, struct region_c* reg);
 void add_to_commit_list(struct commit_list_t* clist, struct transaction* tx);
-void perform_epoch_commit(struct region* reg);
+void perform_epoch_commit(struct region_c* reg);
 bool transaction_in_access_set(Word* word, struct transaction* tx);
 uintptr_t get_writable_copy(Word* word, struct transaction* tx);
 void add_transaction_to_access_set(Word* word, struct transaction* tx);
 void set_writable_copy(Word* word, struct transaction* tx, uintptr_t value);
 bool access_set_not_empty(Word* word);
-void add_allocated_segment(struct region* reg,struct transaction* tx, Word* segment, size_t word_count);
-void add_deallocation(struct transaction* tx, struct segment_node* node);
+void add_allocated_segment(struct region_c* reg,struct transaction* tx, Word* segment, size_t word_count);
+void add_deallocation(struct transaction* tx, struct segment_node_c* node);
 void add_write_entry(struct transaction* tx, uintptr_t address, uintptr_t value);
