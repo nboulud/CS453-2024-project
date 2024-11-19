@@ -20,6 +20,8 @@
 #define COPY_B 1
 #define BATCH_SIZE 100               // Maximum number of transactions in a batch
 #define BATCH_TIMEOUT_MS 100
+#define BATCHER_NB_TX 12ul
+#define MULTIPLE_READERS UINTPTR_MAX - BATCHER_NB_TX
 #ifdef __STDC_NO_ATOMICS__
     #error Current C11 compiler does not support atomic operations
 #endif
@@ -30,13 +32,16 @@
 #include <tm.h>
 
 #include "macros.h"
-
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>  
 #include <stdbool.h> 
 #include <string.h>
 #include <pthread.h>   
 #include <stdatomic.h>
+
+
+static const tx_t read_only_tx = UINTPTR_MAX - 1ul;
 
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
@@ -94,7 +99,7 @@ void tm_destroy(shared_t unused(shared)) {
     pthread_mutex_destroy(&reg->alloc_segments_mutex);
     free(reg->word);
 
-    cleanup_batcher(&reg->batcher);
+    
     free(reg);
 }
 
@@ -142,22 +147,22 @@ tx_t tm_begin(shared_t unused(shared), bool unused(is_ro)) {
 
     struct region_c* reg = (struct region_c*) shared;
 
-    enter_batcher(&reg->batcher);
-
-    uint64_t epoch = reg->batcher.epoch;
+    tx_t tx_id = enter_batcher(&reg->batcher, is_ro);
 
     struct transaction* tx = malloc(sizeof(struct transaction));
     if (!tx) {
-        leave_batcher(&reg->batcher);
+        leave_batcher(&reg->batcher, reg, tx_id);
         printf("TM_BEGIN return invalid_tx \n");
         return invalid_tx;
     }
 
-    memset(tx, 0, sizeof(struct transaction)); 
-
-    tx->epoch = epoch;
+    tx->epoch = atomic_load(&reg->batcher.epoch);
     tx->is_ro = is_ro;
     tx->aborted = false;
+    tx->has_left_batcher = false;
+    tx->cleanup_done = false;
+    tx->tx_id = tx_id; 
+    
 
     // On initialise des wirtes/read sets si besoin
     if (!is_ro) {
@@ -184,8 +189,10 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
 
     if (txt->aborted) {
         // Transaction aborted, clean up
-        cleanup_transaction(txt, reg);
-        leave_batcher(&reg->batcher);
+        if (!txt->cleanup_done) {
+            cleanup_transaction(txt, reg);
+            leave_batcher(&reg->batcher, reg, txt->tx_id);
+        }
         printf("TM_END return false (txt->aborted) \n");
         return false;
     } else {
@@ -194,14 +201,11 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
             add_to_commit_list(&reg->commit_list, txt);
         }
 
-        bool should_commit = leave_batcher(&reg->batcher);
+        leave_batcher(&reg->batcher,reg, txt->tx_id);
 
-        if (should_commit) {
-            // Perform epoch commit
-            perform_epoch_commit(reg);
+        if (!txt->cleanup_done) {
+            cleanup_transaction(txt, reg);
         }
-
-        cleanup_transaction(txt, reg);
         //printf("TM_END return true \n");
         return true;
     }
@@ -220,7 +224,7 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
 bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
     struct region_c* reg = (struct region_c*) shared;
     struct transaction* txt = (struct transaction*) tx;
-    //printf("TM_READ begin, %p, %p, %d, %p\n", txt, source, size ,target);
+    printf("TM_READ begin, %p, %p, %d, %p\n", txt, source, size ,target);
     uintptr_t addr = (uintptr_t) source;
     Word* word_array = NULL;
     size_t word_array_size = 0;
@@ -271,19 +275,19 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         Word* word_t = &word_array[word_index + i];
 
         // Conflict detection
-        if (word_t->owner != NULL && word_t->owner != txt && !txt->is_ro) {
+        if (!txt->is_ro && word_t->owner != NULL && word_t->owner != txt->tx_id) {
             txt->aborted = true;
             printf("TM_READ return false (txt->aborted, Conflict detection) \n");
             return false;
         }
 
         uintptr_t word_value;
-        if (txt->is_ro || !word_t->already_written || word_t->owner != txt) {
+        if (word_t->owner != txt && !word_t->already_written ) {
             // Read from the readable copy
-            word_value = (word_t->readable_copy == COPY_A) ? word_t->copyA : word_t->copyB;
+            word_value = get_writable_copy(word_t);
         } else {
             // Read from the writable copy
-            word_value = get_writable_copy(word_t);
+            word_value = (word_t->readable_copy == COPY_A) ? word_t->copyA : word_t->copyB;
         }
 
         // Calculate the number of bytes to copy for this word
@@ -296,7 +300,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         memcpy((char*)target + bytes_copied, &word_value, bytes_to_copy);
         bytes_copied += bytes_to_copy;
     }
-    //printf("TM_READ return true \n");
+    printf("TM_READ return true \n");
     return true;
 }
 
@@ -311,7 +315,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
 bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
     struct region_c* reg = (struct region_c*) shared;
     struct transaction* txt = (struct transaction*) tx;
-    //printf("TM_WRITE begin, %p, %p, %d, %p\n", txt, source, size ,target);
+    printf("TM_WRITE begin, %p, %p, %d, %p\n", txt, source, size ,target);
     uintptr_t addr = (uintptr_t) target;
     Word* word_array = NULL;
     size_t word_array_size = 0;
@@ -363,11 +367,9 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
         uintptr_t current_addr = addr + i * reg->align;
 
         // Conflict detection
-        if (word_t->owner != NULL && word_t->owner != txt) {
+        if (word_t->owner != NULL && word_t->owner != txt->tx_id) {
             txt->aborted = true;
             printf("TM_WRITE return false (txt->aborted, Conflict Detected) owner : %p , txt : %p  \n", word_t->owner, txt);
-            cleanup_transaction(txt, reg);
-            leave_batcher(&reg->batcher);
             return false;
         }
 
@@ -389,7 +391,7 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
             // Add the write to the transaction's write set
             add_write_entry(txt, current_addr, word_value);
         } else {
-            if (word_t->owner == txt) {
+            if (word_t->owner == txt->tx_id) {
                 // Update the writable copy
                 set_writable_copy(word_t, word_value);
             } else {
@@ -399,7 +401,7 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
             }
         }
     }
-    //printf("TM_WRITE return true \n");
+    printf("TM_WRITE return true %p\n", txt);
     return true;
 }
 
@@ -489,91 +491,200 @@ bool tm_free(shared_t unused(shared), tx_t unused(tx), void* unused(target)) {
 
 
 
+void batch_commit(struct region_c *reg) {
+    // Apply the writes from all transactions
+    struct write_entry *entry = reg->commit_list.head;
+
+    // Apply the writes and free each entry after use
+    while (entry) {
+        Word *word = NULL;
+        uintptr_t addr = entry->address;
+
+        // Determine the segment the address belongs to
+        Word *word_array = NULL;
+        size_t index_in_segment = 0;
+
+        uintptr_t reg_start = (uintptr_t) reg->word;
+        uintptr_t reg_end = reg_start + reg->word_count * reg->align;
+
+        if (addr >= reg_start && addr < reg_end) {
+            // Address in the initial segment
+            word_array = reg->word;
+            index_in_segment = (addr - reg_start) / reg->align;
+        } else {
+            // Search in allocated segments
+            struct segment_node_c *node = reg->allocated_segments;
+            bool found = false;
+            while (node) {
+                uintptr_t seg_start = (uintptr_t) node->segment;
+                uintptr_t seg_end = seg_start + node->size;
+                if (addr >= seg_start && addr < seg_end) {
+                    word_array = (Word *) node->segment;
+                    index_in_segment = (addr - seg_start) / reg->align;
+                    found = true;
+                    break;
+                }
+                node = node->next;
+            }
+            if (!found) {
+                // Address not found, skip this write
+                struct write_entry *next_entry = entry->next;
+                free(entry);
+                entry = next_entry;
+                continue;
+            }
+        }
+
+        // Apply the write
+        word = &word_array[index_in_segment];
+        // Write the new value into the non-readable copy
+        if (word->readable_copy == COPY_A) {
+            word->copyB = entry->value;
+            atomic_store(&word->readable_copy, COPY_B);
+        } else {
+            word->copyA = entry->value;
+            atomic_store(&word->readable_copy, COPY_A);
+        }
+
+        // Reset the owner and already_written fields
+        word->owner = NULL;
+        word->already_written = false;
+
+        // Free the write entry after applying it
+        struct write_entry *next_entry = entry->next;
+        free(entry);
+        entry = next_entry;
+    }
+
+    // Reset the commit list after all entries are freed
+    reg->commit_list.head = NULL;
+    reg->commit_list.tail = NULL;
+
+    // Handle deallocations for segments marked as 'to_be_freed'
+    pthread_mutex_lock(&reg->alloc_segments_mutex);
+
+    struct segment_node_c **current = &reg->allocated_segments;
+    while (*current) {
+        struct segment_node_c *node = *current;
+        if (node->to_be_freed) {
+            // Remove node from the list and update the link
+            *current = node->next;
+
+            // Unlock before freeing memory to avoid holding the lock during free
+            pthread_mutex_unlock(&reg->alloc_segments_mutex);
+
+            // Free the segment and node memory
+            free(node->segment);
+            free(node);
+
+            // Re-lock to continue iterating safely
+            pthread_mutex_lock(&reg->alloc_segments_mutex);
+        } else {
+            current = &(*current)->next;
+        }
+    }
+
+    pthread_mutex_unlock(&reg->alloc_segments_mutex);
+
+    // Update the epoch for the next round of transactions
+    atomic_fetch_add_explicit(&reg->batcher.epoch, 1ul, memory_order_relaxed);
+}
+
+
 
 void init_batcher(struct batcher_str* batcher) {
-    batcher->epoch = 0;
-    atomic_init(&batcher->transaction_count, 0);
-    pthread_mutex_init(&batcher->mutex, NULL);
-    pthread_cond_init(&batcher->cond, NULL);
-    batcher->committing = false;
-    batcher->batch_transaction_count = 0;
-    clock_gettime(CLOCK_MONOTONIC, &batcher->batch_start_time);
+    atomic_init(&batcher->counter, BATCHER_NB_TX);
+    atomic_init(&batcher->nb_entered, 0);
+    atomic_init(&batcher->nb_write_tx, 0);
+    atomic_init(&batcher->pass, 0);
+    atomic_init(&batcher->take, 0);
+    atomic_init(&batcher->epoch, 0);
 }
 
-void wait_for_no_transactions(struct batcher_str* batcher) {
-    pthread_mutex_lock(&batcher->mutex);
-    while (atomic_load(&batcher->transaction_count) > 0) {
-        pthread_cond_wait(&batcher->cond, &batcher->mutex);
+void wait_for_no_transactions(struct batcher_str *batcher) {
+    while (atomic_load_explicit(&batcher->nb_entered, memory_order_acquire) > 0) {
+        // Busy-wait
+        sched_yield(); // Optionally yield to other threads
     }
-    pthread_mutex_unlock(&batcher->mutex);
 }
 
-void cleanup_batcher(struct batcher_str* batcher) {
-    pthread_mutex_destroy(&batcher->mutex);
-    pthread_cond_destroy(&batcher->cond);
-}
 
-void enter_batcher(struct batcher_str* batcher) {
-    pthread_mutex_lock(&batcher->mutex);
 
-    // Wait if a commit is in progress
-    while (batcher->committing) {
-        pthread_cond_wait(&batcher->cond, &batcher->mutex);
+tx_t enter_batcher(struct batcher_str *batcher, bool is_ro) {
+    if (is_ro) {
+        // Acquire status lock
+        unsigned long ticket = atomic_fetch_add_explicit(&batcher->take, 1ul, memory_order_relaxed);
+        while (atomic_load_explicit(&batcher->pass, memory_order_relaxed) != ticket)
+            ; // Busy-wait
+        atomic_thread_fence(memory_order_acquire);
+
+        atomic_fetch_add_explicit(&batcher->nb_entered, 1ul, memory_order_relaxed);
+
+        // Release status lock
+        atomic_fetch_add_explicit(&batcher->pass, 1ul, memory_order_release);
+
+        return (tx_t)read_only_tx; // Define read_only_tx appropriately
+    } else {
+        while (true) {
+            unsigned long ticket = atomic_fetch_add_explicit(&batcher->take, 1ul, memory_order_relaxed);
+            while (atomic_load_explicit(&batcher->pass, memory_order_relaxed) != ticket)
+                ; // Busy-wait
+            atomic_thread_fence(memory_order_acquire);
+
+            // Acquire status lock
+            if (atomic_load_explicit(&batcher->counter, memory_order_relaxed) == 0) {
+                unsigned long epoch = atomic_load_explicit(&batcher->epoch, memory_order_relaxed);
+                atomic_fetch_add_explicit(&batcher->pass, 1ul, memory_order_release);
+
+                while (atomic_load_explicit(&batcher->epoch, memory_order_relaxed) == epoch)
+                    ; // Busy-wait
+                atomic_thread_fence(memory_order_acquire);
+            } else {
+                atomic_fetch_sub_explicit(&batcher->counter, 1ul, memory_order_release);
+                break;
+            }
+        }
+        atomic_fetch_add_explicit(&batcher->nb_entered, 1ul, memory_order_relaxed);
+        atomic_fetch_add_explicit(&batcher->pass, 1ul, memory_order_release);
+
+        tx_t tx = atomic_fetch_add_explicit(&batcher->nb_write_tx, 1ul, memory_order_relaxed) + 1ul;
+        atomic_thread_fence(memory_order_release);
+
+        return tx;
     }
-
-    // Increment transaction counts
-    atomic_fetch_add(&batcher->transaction_count, 1);
-    batcher->batch_transaction_count++;
-
-    // If this is the first transaction in the batch, record the start time
-    if (batcher->batch_transaction_count == 1) {
-        clock_gettime(CLOCK_MONOTONIC, &batcher->batch_start_time);
-    }
-
-    pthread_mutex_unlock(&batcher->mutex);
 }
+
 
 uint64_t get_current_epoch(struct batcher_str* batcher) {
     return batcher->epoch;
 }
 
-bool leave_batcher(struct batcher_str* batcher) {
-    pthread_mutex_lock(&batcher->mutex);
+void leave_batcher(struct batcher_str *batcher, struct region_c *region, tx_t tx) {
+    // Acquire status lock
+    unsigned long ticket = atomic_fetch_add_explicit(&batcher->take, 1ul, memory_order_relaxed);
+    while (atomic_load_explicit(&batcher->pass, memory_order_relaxed) != ticket)
+        ; // Busy-wait
+    atomic_thread_fence(memory_order_acquire);
 
-    atomic_fetch_sub(&batcher->transaction_count, 1);
-    batcher->batch_transaction_count--;
-
-    bool should_commit = false;
-
-    // Check if commit conditions are met
-    if (batcher->batch_transaction_count == 0) {
-        // All transactions in the batch have finished
-        should_commit = true;
-    } else if (batcher->batch_transaction_count >= BATCH_SIZE) {
-        // Batch size limit reached
-        should_commit = true;
-    } else {
-        // Check if batch timeout has been exceeded
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        uint64_t elapsed_ms = (now.tv_sec - batcher->batch_start_time.tv_sec) * 1000 +
-                              (now.tv_nsec - batcher->batch_start_time.tv_nsec) / 1000000;
-
-        if (elapsed_ms >= BATCH_TIMEOUT_MS) {
-            should_commit = true;
+    if (atomic_fetch_sub_explicit(&batcher->nb_entered, 1ul, memory_order_relaxed) == 1ul) {
+        if (atomic_load_explicit(&batcher->nb_write_tx, memory_order_relaxed) > 0) {
+            batch_commit(region); // Implement batch_commit similar to the first code
+            atomic_store_explicit(&batcher->nb_write_tx, 0, memory_order_relaxed);
+            atomic_store_explicit(&batcher->counter, BATCHER_NB_TX, memory_order_relaxed);
+            atomic_fetch_add_explicit(&batcher->epoch, 1ul, memory_order_relaxed);
         }
+        atomic_fetch_add_explicit(&batcher->pass, 1ul, memory_order_release);
+    } else if (tx != read_only_tx) {
+        unsigned long epoch = atomic_load_explicit(&batcher->epoch, memory_order_relaxed);
+        atomic_fetch_add_explicit(&batcher->pass, 1ul, memory_order_release);
+
+        while (atomic_load_explicit(&batcher->epoch, memory_order_relaxed) == epoch)
+            ; // Busy-wait
+    } else {
+        atomic_fetch_add_explicit(&batcher->pass, 1ul, memory_order_release);
     }
-
-    if (should_commit && !batcher->committing) {
-        // Set committing flag and wake up any waiting threads
-        batcher->committing = true;
-        pthread_cond_broadcast(&batcher->cond);
-    }
-
-    pthread_mutex_unlock(&batcher->mutex);
-
-    return should_commit;
 }
+
 
 void init_rw_sets(struct transaction* tx) {
     tx->write_set_head = NULL;
@@ -583,6 +694,12 @@ void init_rw_sets(struct transaction* tx) {
 }
 
 void cleanup_transaction(struct transaction* tx, struct region_c* reg) {
+
+    if (tx->cleanup_done) {
+        return;
+    }
+    tx->cleanup_done = true;
+
     struct write_entry* entry = tx->write_set_head;
     while (entry) {
         // Reset the word's owner and already_written fields
@@ -669,111 +786,6 @@ void add_to_commit_list(struct commit_list_t* clist, struct transaction* tx) {
 }
 
 
-void perform_epoch_commit(struct region_c* reg) {
-
-    struct batcher_str* batcher = &reg->batcher;
-    pthread_mutex_lock(&batcher->mutex);
-    batcher->committing = false;
-    batcher->batch_transaction_count = 0;
-    clock_gettime(CLOCK_MONOTONIC, &batcher->batch_start_time);
-    batcher->epoch++;
-    pthread_cond_broadcast(&batcher->cond);
-    pthread_mutex_unlock(&batcher->mutex);
-
-    struct write_entry* entry = reg->commit_list.head;
-
-    // Apply the writes and free each entry after use
-    while (entry) {
-        Word* word = NULL;
-        uintptr_t addr = entry->address;
-
-        // Determine the segment the address belongs to
-        Word* word_array = NULL;
-        size_t index_in_segment = 0;
-
-        uintptr_t reg_start = (uintptr_t) reg->word;
-        uintptr_t reg_end = reg_start + reg->word_count * reg->align;
-
-        if (addr >= reg_start && addr < reg_end) {
-            // Address in the initial segment
-            word_array = reg->word;
-            index_in_segment = (addr - reg_start) / reg->align;
-        } else {
-            // Search in allocated segments
-            segment_node_c* node = reg->allocated_segments;
-            bool found = false;
-            while (node) {
-                uintptr_t seg_start = (uintptr_t) node->segment;
-                uintptr_t seg_end = seg_start + node->size;
-                if (addr >= seg_start && addr < seg_end) {
-                    word_array = (Word*) node->segment;
-                    index_in_segment = (addr - seg_start) / reg->align;
-                    found = true;
-                    break;
-                }
-                node = node->next;
-            }
-            if (!found) {
-                entry = entry->next;
-                continue;
-            }
-        }
-
-        // Apply the write
-        word = &word_array[index_in_segment];
-        // Write the new value into the non-readable copy
-        if (word->readable_copy == COPY_A) {
-            word->copyB = entry->value;
-            atomic_store(&word->readable_copy, COPY_B);
-        } else {
-            word->copyA = entry->value;
-            atomic_store(&word->readable_copy, COPY_A);
-        }
-
-        // Reset the owner and already_written fields
-        word->owner = NULL;
-        word->already_written = false;
-
-        // Free the write entry after applying it
-        struct write_entry* next_entry = entry->next;
-        free(entry);
-        entry = next_entry;
-    }
-
-    // Reset the commit list after all entries are freed
-    reg->commit_list.head = NULL;
-    reg->commit_list.tail = NULL;
-
-    // Handle deallocations for segments marked as 'to_be_freed'
-    pthread_mutex_lock(&reg->alloc_segments_mutex);
-
-    segment_node_c** current = &reg->allocated_segments;
-    while (*current) {
-        segment_node_c* node = *current;
-        if (node->to_be_freed) {
-            // Remove node from the list and update the link
-            *current = node->next;
-
-            // Unlock before freeing memory to avoid holding the lock during free
-            pthread_mutex_unlock(&reg->alloc_segments_mutex);
-
-            // Free the segment and node memory
-            free(node->segment);
-            free(node);
-
-            // Re-lock to continue iterating safely
-            pthread_mutex_lock(&reg->alloc_segments_mutex);
-        } else {
-            current = &(*current)->next;
-        }
-    }
-
-    pthread_mutex_unlock(&reg->alloc_segments_mutex);
-
-    // Update the epoch for the next round of transactions
-    reg->epoch++;
-
-}
 
 bool transaction_in_access_set(Word* word, struct transaction* tx) {
     // Let's assume each transaction has a unique ID (e.g., pointer value)

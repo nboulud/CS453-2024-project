@@ -29,6 +29,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 // -------------------------------------------------------------------------- //
 
@@ -67,19 +68,22 @@ bool     tm_free(shared_t, tx_t, void*);
 #define COPY_B 1
 #define BATCH_SIZE 100               // Maximum number of transactions in a batch
 #define BATCH_TIMEOUT_MS 100
+#define BATCHER_NB_TX 12ul
+#define MULTIPLE_READERS UINTPTR_MAX - BATCHER_NB_TX
 
 typedef struct Word{
     uintptr_t copyA;
     uintptr_t copyB;
     int readable_copy; //Indique quelle copie est lisible (AouB)
     bool already_written; 
-    struct transaction* owner;
+    tx_t* owner;
 }Word;
 
 typedef struct transaction {
     uint64_t epoch;
     bool is_ro;
     bool aborted;
+    tx_t tx_id; // Add this line
     // Write set for the transaction
     struct write_entry* write_set_head;
     struct write_entry* write_set_tail;
@@ -87,17 +91,18 @@ typedef struct transaction {
     struct segment_node_c* alloc_segments;
     struct segment_node_c* free_segments;
     // Other fields as needed
+    bool has_left_batcher;
+    bool cleanup_done;
 } transaction;
 
-typedef struct batcher_str {
-    uint64_t epoch;
-    _Atomic uint64_t transaction_count;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    bool committing;
-    struct timespec batch_start_time;
-    unsigned int batch_transaction_count;
-} batcher_str;
+struct batcher_str {
+    atomic_ulong counter;
+    atomic_ulong nb_entered;
+    atomic_ulong nb_write_tx;
+    atomic_ulong pass; // Ticket that acquires the lock
+    atomic_ulong take; // Ticket the next thread takes
+    atomic_ulong epoch;
+};
 
 typedef struct write_entry {
     size_t word_index;          // Index of the word in the versions array
@@ -136,9 +141,9 @@ typedef struct segment_node_c {
 void init_batcher(struct batcher_str* batcher);
 void wait_for_no_transactions(struct batcher_str* batcher);
 void cleanup_batcher(struct batcher_str* batcher);
-void enter_batcher(struct batcher_str* batcher);
+tx_t enter_batcher(struct batcher_str* batcher, bool is_ro);
 uint64_t get_current_epoch(struct batcher_str* batcher);
-bool leave_batcher(struct batcher_str* batcher);
+void leave_batcher(struct batcher_str* batcher, struct region_c* reg, tx_t id);
 void init_rw_sets(struct transaction* tx);
 void cleanup_transaction(struct transaction* tx, struct region_c* reg);
 void add_to_commit_list(struct commit_list_t* clist, struct transaction* tx);
