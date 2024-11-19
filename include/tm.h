@@ -30,6 +30,7 @@
 #include <stdint.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdio.h>
 
 // -------------------------------------------------------------------------- //
 
@@ -76,7 +77,7 @@ typedef struct Word{
     uintptr_t copyB;
     int readable_copy; //Indique quelle copie est lisible (AouB)
     bool already_written; 
-    tx_t* owner;
+    tx_t owner;
 }Word;
 
 typedef struct transaction {

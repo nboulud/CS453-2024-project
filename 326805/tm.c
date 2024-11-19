@@ -52,7 +52,7 @@ static const tx_t read_only_tx = UINTPTR_MAX - 1ul;
 shared_t tm_create(size_t unused(size), size_t unused(align)) {
     struct region_c* reg = malloc(sizeof(struct region_c));
     if(!reg) return invalid_shared;
-    printf("TM_CREATE begin %ld, %d \n",size , align);
+    printf("TM_CREATE begin %zu, %zu \n",size , align);
 
     memset(reg, 0, sizeof(struct region_c));
 
@@ -74,7 +74,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align)) {
         reg->word[i].copyB = 0;
         reg->word[i].readable_copy = COPY_A;
         reg->word[i].already_written = false;
-        reg->word[i].owner = NULL; 
+        reg->word[i].owner = invalid_tx; 
     }
     
     init_batcher(&reg->batcher);
@@ -132,7 +132,7 @@ size_t tm_size(shared_t unused(shared)) {
 size_t tm_align(shared_t unused(shared)) {
     printf("TM_ALIGN begin %p \n",shared);
     struct region_c* reg = (struct region_c*) shared;
-    printf("TM_ALIGN return %ld \n",reg->align);
+    printf("TM_ALIGN return %zu \n",reg->align);
     return reg->align;
 }
 
@@ -143,7 +143,7 @@ size_t tm_align(shared_t unused(shared)) {
 **/
 tx_t tm_begin(shared_t unused(shared), bool unused(is_ro)) {
 
-    //printf("TM_BEGIN begin (1 is read only)  %d \n", is_ro);
+    printf("TM_BEGIN begin (1 is read only)  %d \n", is_ro);
 
     struct region_c* reg = (struct region_c*) shared;
 
@@ -169,7 +169,7 @@ tx_t tm_begin(shared_t unused(shared), bool unused(is_ro)) {
         init_rw_sets(tx);
     }
 
-    //printf("TM_BEGIN return correctly \n");
+    printf("TM_BEGIN return correctly \n");
     return (tx_t)(uintptr_t)tx;
     
 }
@@ -185,14 +185,14 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
 
     struct transaction* txt = (struct transaction*) tx;
 
-    //printf("TM_END begin %d, %p \n",shared, txt);
+    printf("TM_END begin %p, %p \n",shared, txt);
 
     if (txt->aborted) {
         // Transaction aborted, clean up
         if (!txt->cleanup_done) {
             cleanup_transaction(txt, reg);
-            leave_batcher(&reg->batcher, reg, txt->tx_id);
         }
+        leave_batcher(&reg->batcher, reg, txt->tx_id);
         printf("TM_END return false (txt->aborted) \n");
         return false;
     } else {
@@ -206,7 +206,7 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
         if (!txt->cleanup_done) {
             cleanup_transaction(txt, reg);
         }
-        //printf("TM_END return true \n");
+        printf("TM_END return true \n");
         return true;
     }
 
@@ -224,7 +224,7 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
 bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
     struct region_c* reg = (struct region_c*) shared;
     struct transaction* txt = (struct transaction*) tx;
-    printf("TM_READ begin, %p, %p, %d, %p\n", txt, source, size ,target);
+    printf("TM_READ begin, %p, %p, %zu, %p\n", txt, source, size ,target);
     uintptr_t addr = (uintptr_t) source;
     Word* word_array = NULL;
     size_t word_array_size = 0;
@@ -275,14 +275,14 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         Word* word_t = &word_array[word_index + i];
 
         // Conflict detection
-        if (!txt->is_ro && word_t->owner != NULL && word_t->owner != txt->tx_id) {
+        if (!txt->is_ro && word_t->owner != invalid_tx && word_t->owner != txt->tx_id) {
             txt->aborted = true;
             printf("TM_READ return false (txt->aborted, Conflict detection) \n");
             return false;
         }
 
         uintptr_t word_value;
-        if (word_t->owner != txt && !word_t->already_written ) {
+        if (word_t->owner != txt->tx_id && !word_t->already_written ) {
             // Read from the readable copy
             word_value = get_writable_copy(word_t);
         } else {
@@ -315,7 +315,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
 bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* target) {
     struct region_c* reg = (struct region_c*) shared;
     struct transaction* txt = (struct transaction*) tx;
-    printf("TM_WRITE begin, %p, %p, %d, %p\n", txt, source, size ,target);
+    printf("TM_WRITE begin, %p, %p, %zu, %p\n", txt, source, size ,target);
     uintptr_t addr = (uintptr_t) target;
     Word* word_array = NULL;
     size_t word_array_size = 0;
@@ -367,9 +367,9 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
         uintptr_t current_addr = addr + i * reg->align;
 
         // Conflict detection
-        if (word_t->owner != NULL && word_t->owner != txt->tx_id) {
+        if (word_t->owner != invalid_tx && word_t->owner != txt->tx_id) {
             txt->aborted = true;
-            printf("TM_WRITE return false (txt->aborted, Conflict Detected) owner : %p , txt : %p  \n", word_t->owner, txt);
+            printf("TM_WRITE return false (txt->aborted, Conflict Detected) owner : %ld , txt : %ld  \n", word_t->owner, txt->tx_id);
             return false;
         }
 
@@ -401,7 +401,7 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
             }
         }
     }
-    printf("TM_WRITE return true %p\n", txt);
+    printf("TM_WRITE return true %p, %ld\n", txt, txt->tx_id);
     return true;
 }
 
@@ -416,7 +416,7 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
 
     struct region_c* reg = (struct region_c*) shared;
     struct transaction* txt = (struct transaction*) tx;
-    printf("TM_ALLOC begin %p, %d, %p  \n", txt, size, target);
+    printf("TM_ALLOC begin %p, %zu, %p  \n", txt, size, target);
     
     size_t word_count = size / reg->align;
     Word* new_word = malloc(sizeof(Word) * word_count);
@@ -430,7 +430,7 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
         new_word[i].copyB = 0;
         new_word[i].readable_copy = COPY_A;
         new_word[i].already_written = false;
-        new_word[i].owner = NULL;
+        new_word[i].owner = invalid_tx;
     }
     
     add_allocated_segment(reg,txt, new_word, word_count);
@@ -547,7 +547,7 @@ void batch_commit(struct region_c *reg) {
         }
 
         // Reset the owner and already_written fields
-        word->owner = NULL;
+        word->owner = invalid_tx;
         word->already_written = false;
 
         // Free the write entry after applying it
@@ -740,7 +740,7 @@ void cleanup_transaction(struct transaction* tx, struct region_c* reg) {
             }
         }
         word = &word_array[index_in_segment];
-        word->owner = NULL;
+        word->owner = invalid_tx;
         word->already_written = false;
 
         struct write_entry* next = entry->next;
@@ -789,7 +789,7 @@ void add_to_commit_list(struct commit_list_t* clist, struct transaction* tx) {
 
 bool transaction_in_access_set(Word* word, struct transaction* tx) {
     // Let's assume each transaction has a unique ID (e.g., pointer value)
-    return word->owner == tx;
+    return word->owner == tx->tx_id;
 }
 
 uintptr_t get_writable_copy(Word* word) {
@@ -802,7 +802,7 @@ uintptr_t get_writable_copy(Word* word) {
 }
 
 void add_transaction_to_access_set(Word* word, struct transaction* tx) {
-    word->owner = tx;
+    word->owner = tx->tx_id;
 }
 
 void set_writable_copy(Word* word, uintptr_t value) {
@@ -815,7 +815,7 @@ void set_writable_copy(Word* word, uintptr_t value) {
 }
 
 bool access_set_not_empty(Word* word) {
-    return word->owner != NULL;
+    return word->owner != invalid_tx;
 }
 
 void add_allocated_segment(struct region_c* reg, struct transaction* tx, Word* segment, size_t word_count) {
